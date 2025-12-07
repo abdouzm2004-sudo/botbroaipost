@@ -1,9 +1,11 @@
-python-telegram-bot==20.3
-python-dotenv
-google-generativeai
+fastapi
+uvicorn[standard]
+python-telegram-bot[webhooks]
+python-multipart
 google-api-python-client
 google-auth
+google-auth-oauthlib
 google-auth-httplib2
+python-dotenv
 pytz
-telegram
-Flask
+google-generative-ai
