@@ -7,7 +7,7 @@ google-api-python-client
 google-auth
 google-auth-oauthlib
 google-auth-httplib2
-google-generative-ai
+google-generativeai
 
 pytz
 python-dotenv
