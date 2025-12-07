@@ -22,6 +22,10 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload
 from googleapiclient.errors import HttpError
 
+# FastAPI / Uvicorn for webhook
+from fastapi import FastAPI, Request
+import uvicorn
+
 # ===================== إعداد عام =====================
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s | %(levelname)s | %(message)s")
@@ -668,21 +672,68 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                   reply_markup=main_menu_keyboard())
 
 
-# ===================== نقطة الدخول =====================
-def main():
-    load_state()
-    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+# ===================== FastAPI Webhook integration =====================
+# Load previous state
+load_state()
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(on_button))
-    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
-    app.add_handler(
-        MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text))
+# FastAPI app and telegram Application (Dispatcher)
+fastapp = FastAPI()
+app_telegram = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
 
-    logging.info("Bot is running...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES,
-                    drop_pending_updates=True)
+# Register handlers on the telegram application (same as before)
+app_telegram.add_handler(CommandHandler("start", start))
+app_telegram.add_handler(CallbackQueryHandler(on_button))
+app_telegram.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+app_telegram.add_handler(
+    MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text))
+
+# WEBHOOK settings
+WEBHOOK_BASE = os.getenv("WEBHOOK_URL") or ""
+PORT = int(os.getenv("PORT", "8000"))
+if not WEBHOOK_BASE:
+    logging.warning(
+        "WEBHOOK_URL not set. You must set WEBHOOK_URL env var to your Replit/host URL."
+    )
+WEBHOOK_PATH = f"/{TELEGRAM_BOT_TOKEN}"
+WEBHOOK_URL = f"{WEBHOOK_BASE}{WEBHOOK_PATH}"
 
 
+@fastapp.on_event("startup")
+async def on_startup():
+    # Initialize and start the telegram application so job_queue and dispatcher run
+    await app_telegram.initialize()
+    await app_telegram.start()
+    # Set webhook on Telegram
+    try:
+        await app_telegram.bot.set_webhook(WEBHOOK_URL)
+        logging.info(f"✅ Webhook set to {WEBHOOK_URL}")
+    except Exception as e:
+        logging.error(f"❌ Failed to set webhook: {e}")
+
+
+@fastapp.on_event("shutdown")
+async def on_shutdown():
+    try:
+        await app_telegram.bot.delete_webhook()
+    except Exception:
+        pass
+    await app_telegram.stop()
+    await app_telegram.shutdown()
+
+
+@fastapp.post("/{token}")
+async def telegram_webhook(token: str, request: Request):
+    # basic check: ensure path token matches
+    if token != TELEGRAM_BOT_TOKEN:
+        return {"ok": False, "error": "invalid token path"}
+    data = await request.json()
+    update = Update.de_json(data, app_telegram.bot)
+    # enqueue update for processing by python-telegram-bot
+    await app_telegram.update_queue.put(update)
+    return {"ok": True}
+
+
+# ===================== Entrypoint (uvicorn) =====================
 if __name__ == "__main__":
-    main()
+    # If your file name is different, change "main:fastapp" accordingly
+    uvicorn.run("main:fastapp", host="0.0.0.0", port=PORT)
