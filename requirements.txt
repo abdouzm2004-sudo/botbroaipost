@@ -1,7 +1,8 @@
 fastapi==0.95.2
 uvicorn[standard]==0.22.0
 
-python-telegram-bot==20.7
+# السماح بترقية python-telegram-bot لسلسلة 20.x الأحدث لحل مشكلة Updater
+python-telegram-bot>=20.7,<21.0
 
 google-api-python-client==2.88.0
 google-auth>=2.15.0,<3.0.0
