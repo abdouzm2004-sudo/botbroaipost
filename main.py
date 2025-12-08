@@ -1,4 +1,4 @@
-# main.py
+# main.py (webhook-ready)
 import os
 import io
 import json
@@ -23,6 +23,10 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload
 from googleapiclient.errors import HttpError
 
+# Web server for webhook
+from fastapi import FastAPI, Request
+import uvicorn
+
 # ====== إعداد لوجنج و env ======
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s | %(levelname)s | %(message)s")
@@ -30,6 +34,9 @@ load_dotenv()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # مثال: https://your-service.koyeb.app
+PORT = int(os.getenv("PORT", "8000"))
+
 if not TELEGRAM_BOT_TOKEN:
     raise RuntimeError("يرجى ضبط TELEGRAM_BOT_TOKEN في متغيرات البيئة.")
 
@@ -724,7 +731,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                   reply_markup=main_menu_keyboard())
 
 
-# ============== Polling entrypoint ==============
+# ============== Polling entrypoint (محذوف) ==============
 def load_state():
     # نحاول تحميل ملف فهرس عام (اختياري) إن رغبت مستقبلًا
     global USER_STATE
@@ -739,21 +746,78 @@ def load_state():
 
 load_state()
 
+# ---- Telegram Application global (ستُستخدم داخل FastAPI) ----
+application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
 
-def main():
-    application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+# أضف الـ handlers
+application.add_handler(CommandHandler("start", start))
+application.add_handler(CallbackQueryHandler(on_button))
+application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text))
 
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CallbackQueryHandler(on_button))
-    application.add_handler(
-        MessageHandler(filters.Document.ALL, handle_document))
-    application.add_handler(
-        MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text))
+# ---- FastAPI app ----
+app = FastAPI()
 
-    logging.info("Starting polling...")
-    application.run_polling(allowed_updates=Update.ALL_TYPES,
-                            drop_pending_updates=True)
+
+@app.on_event("startup")
+async def on_startup():
+    logging.info("Starting Telegram application (webhook mode)...")
+    # تهيئة وتشغيل application
+    await application.initialize()
+    await application.start()
+    # ضبط webhook على Telegram (إذا تم تزويد WEBHOOK_URL)
+    if WEBHOOK_URL:
+        webhook_full = WEBHOOK_URL.rstrip("/") + "/webhook"
+        logging.info(f"Setting Telegram webhook: {webhook_full}")
+        try:
+            await application.bot.set_webhook(webhook_full)
+            logging.info("Webhook set successfully.")
+        except Exception as e:
+            logging.error(f"Failed to set webhook: {e}")
+    else:
+        logging.warning("WEBHOOK_URL not set — webhook will not be registered automatically.")
+
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    logging.info("Shutting down Telegram application...")
+    try:
+        await application.stop()
+        await application.shutdown()
+    except Exception as e:
+        logging.error(f"Error stopping application: {e}")
+
+
+@app.post("/webhook")
+async def telegram_webhook(request: Request):
+    """
+    Telegram will POST updates here. تحويل الـ JSON إلى Update وتمريرها إلى application.
+    """
+    try:
+        data = await request.json()
+    except Exception:
+        return {"ok": False, "error": "invalid json"}
+
+    # تحويل JSON لـ Update
+    try:
+        update = Update.de_json(data, application.bot)
+    except Exception as e:
+        logging.error(f"Failed to parse Update: {e}")
+        return {"ok": False, "error": "bad update"}
+
+    # مرّر الـ update إلى مكتبة telegram (بشكل متزامن)
+    try:
+        await application.process_update(update)
+    except Exception as e:
+        logging.error(f"Error processing update: {e}")
+    return {"ok": True}
+
+
+# optional health check / root
+@app.get("/")
+async def root():
+    return {"ok": True, "service": "telegram-webhook"}
 
 
 if __name__ == "__main__":
-    main()
+    uvicorn.run(app, host="0.0.0.0", port=PORT)
