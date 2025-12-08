@@ -1,13 +1,11 @@
-fastapi==0.95.2
-uvicorn[standard]==0.22.0
-
-# Allow latest 20.x PTB for Python 3.11 compatibility and bugfixes
-python-telegram-bot>=20.7,<21.0
-
-google-api-python-client==2.88.0
-google-auth>=2.15.0,<3.0.0
-google-auth-oauthlib==1.1.0
-google-generativeai==0.8.5
-
-python-dotenv==1.0.0
-pytz==2023.3
+python-telegram-bot==20.3
+python-dotenv
+google-generativeai
+google-api-python-client
+google-auth
+google-auth-httplib2
+pytz
+telegram
+flask
+fastapi
+uvicorn
