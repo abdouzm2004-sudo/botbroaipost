@@ -10,9 +10,6 @@ from datetime import time as dtime
 
 import pytz
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request, Response, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (ApplicationBuilder, CommandHandler, MessageHandler,
                           CallbackQueryHandler, ContextTypes, filters)
@@ -33,14 +30,8 @@ load_dotenv()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-WEBHOOK_BASE = os.getenv("WEBHOOK_BASE")  # مثال: https://your-service.onrender.com
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")  # أي نص سري تختاره (مثال: xYz12345)
-
 if not TELEGRAM_BOT_TOKEN:
     raise RuntimeError("يرجى ضبط TELEGRAM_BOT_TOKEN في متغيرات البيئة.")
-
-if not WEBHOOK_BASE or not WEBHOOK_SECRET:
-    logging.warning("WEBHOOK_BASE أو WEBHOOK_SECRET غير مضبوطين. سيعمل التطبيق محلياً لكن بدون ربط Webhook آمن.")
 
 # إن كان لديك مفتاح Gemini (Google generative AI) ضعه في GOOGLE_API_KEY
 if GOOGLE_API_KEY:
@@ -48,18 +39,20 @@ if GOOGLE_API_KEY:
 GEMINI_MODEL = "gemini-2.5-flash"
 TZ = pytz.timezone("Africa/Algiers")
 
-USERS_DIR = "users"
+USERS_DIR = "users"  # مجلد حفظ ملفات المستخدمين
 os.makedirs(USERS_DIR, exist_ok=True)
 
-STATE_FILE = "user_state.json"
+STATE_FILE = "user_state.json"  # (اختياري) ملف فهرس/نسخ احتياطية
 USER_STATE: Dict[int, Dict[str, Any]] = {}
 
+# قيمة افتراضية لtoken_uri
 OAUTH_TOKEN_URI_DEFAULT = "https://oauth2.googleapis.com/token"
 
-# ---------- (نسخ بقية وظائفك كما في الملف الأصلي) ----------
-# دوال مساعدة لحفظ/تحميل المستخدم
+
+# ------------------ مساعدات قراءة/حفظ حالة مستخدم منفصلة ------------------
 def user_filepath(chat_id: int) -> str:
     return os.path.join(USERS_DIR, f"{chat_id}.json")
+
 
 def load_user_file(chat_id: int) -> Optional[Dict[str, Any]]:
     path = user_filepath(chat_id)
@@ -74,6 +67,7 @@ def load_user_file(chat_id: int) -> Optional[Dict[str, Any]]:
             return None
     return None
 
+
 def save_user_file(chat_id: int, data: Dict[str, Any]):
     path = user_filepath(chat_id)
     try:
@@ -83,13 +77,22 @@ def save_user_file(chat_id: int, data: Dict[str, Any]):
     except Exception as e:
         logging.error(f"Failed to save user file {path}: {e}")
 
+
+# ------------------ إدارة الحالة في الذاكرة (مستمدة من ملفات المستخدم) ------------------
 def get_chat(chat_id: int) -> Dict[str, Any]:
+    """
+    إرجاع إعدادات المحادثة. إن لم تكن موجودة يتم محاولة تحميل ملف المستخدم.
+    """
     if chat_id in USER_STATE:
         return USER_STATE[chat_id]
+
+    # محاولة تحميل من ملف المستخدم
     data = load_user_file(chat_id)
     if data:
         USER_STATE[chat_id] = data
         return USER_STATE[chat_id]
+
+    # لم يوجد ملف -> تهيئة افتراضية ودفع المستخدم لمرحلة رفع JSON
     USER_STATE[chat_id] = {
         "next": "await_json",
         "oauth_json": None,
@@ -106,26 +109,43 @@ def get_chat(chat_id: int) -> Dict[str, Any]:
     }
     return USER_STATE[chat_id]
 
-# لوحات الأزرار (كما كانت)
+
+# ===================== لوحات الأزرار =====================
 def main_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [[InlineKeyboardButton("انشر الآن", callback_data="publish_now")],
-         [InlineKeyboardButton("🔘 ضبط النشر التلقائي", callback_data="autopost_setup")],
-         [InlineKeyboardButton("📋 عرض الإعدادات الحالية", callback_data="show_settings")]])
+         [
+             InlineKeyboardButton("🔘 ضبط النشر التلقائي",
+                                  callback_data="autopost_setup")
+         ],
+         [
+             InlineKeyboardButton("📋 عرض الإعدادات الحالية",
+                                  callback_data="show_settings")
+         ]])
+
 
 def yes_no_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[InlineKeyboardButton("نعم", callback_data="save_yes"),
-                                  InlineKeyboardButton("لا", callback_data="save_no")]])
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("نعم", callback_data="save_yes"),
+        InlineKeyboardButton("لا", callback_data="save_no")
+    ]])
+
 
 def after_publish_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[InlineKeyboardButton("📋 عرض الإعدادات الحالية",
-                                                     callback_data="show_settings")]])
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("📋 عرض الإعدادات الحالية",
+                             callback_data="show_settings")
+    ]])
+
 
 def autopost_control_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[InlineKeyboardButton("⛔ إيقاف النشر التلقائي",
-                                                     callback_data="autopost_stop")]])
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("⛔ إيقاف النشر التلقائي",
+                             callback_data="autopost_stop")
+    ]])
 
-# استخراج بيانات OAuth
+
+# ===================== استخراج بيانات ملف OAuth المرفوع =====================
 def extract_oauth_fields(oauth_json: Dict[str, Any]) -> Dict[str, str]:
     block = oauth_json.get("installed") or oauth_json.get("web")
     if not block:
@@ -133,6 +153,7 @@ def extract_oauth_fields(oauth_json: Dict[str, Any]) -> Dict[str, str]:
     for key in ("client_id", "client_secret"):
         if key not in block:
             raise RuntimeError(f"ملف JSON ناقص الحقل: {key}")
+    # token_uri نضع الافتراضي إن لم يوجد
     token_uri = block.get("token_uri", OAUTH_TOKEN_URI_DEFAULT)
     return {
         "client_id": block["client_id"],
@@ -140,12 +161,16 @@ def extract_oauth_fields(oauth_json: Dict[str, Any]) -> Dict[str, str]:
         "token_uri": token_uri
     }
 
-# بناء خدمات جوجل
+
+# ===================== بناء خدمات Google باستخدام بيانات المستخدم =====================
 def build_services(cfg: Dict[str, Any]):
+    # نحاول أخذ الحقول من cfg أو من oauth_json بداخله
     client_id = cfg.get("oauth_client_id")
     client_secret = cfg.get("oauth_client_secret")
     token_uri = cfg.get("oauth_token_uri") or OAUTH_TOKEN_URI_DEFAULT
     refresh_token = cfg.get("refresh_token")
+
+    # لو لم تكن client id/secret موجودين، حاول استخراجها من oauth_json
     if not client_id or not client_secret:
         oauth_json = cfg.get("oauth_json")
         if oauth_json:
@@ -153,11 +178,16 @@ def build_services(cfg: Dict[str, Any]):
             client_id = fields["client_id"]
             client_secret = fields["client_secret"]
             token_uri = fields.get("token_uri", token_uri)
+            # خزّنهم في cfg لمرة مستقبلية
             cfg["oauth_client_id"] = client_id
             cfg["oauth_client_secret"] = client_secret
             cfg["oauth_token_uri"] = token_uri
+
     if not (client_id and client_secret and refresh_token):
-        raise RuntimeError("بيانات OAuth ناقصة. أرسل JSON ثم REFRESH_TOKEN ثم DRIVE_FOLDER_ID.")
+        raise RuntimeError(
+            "بيانات OAuth ناقصة. أرسل JSON ثم REFRESH_TOKEN ثم DRIVE_FOLDER_ID."
+        )
+
     creds = Credentials(None,
                         refresh_token=refresh_token,
                         token_uri=token_uri,
@@ -171,18 +201,24 @@ def build_services(cfg: Dict[str, Any]):
     youtube = build("youtube", "v3", credentials=creds)
     return drive, youtube
 
-# Drive helpers (نفسها)
+
+# ===================== Drive helpers =====================
 def list_videos(drive, folder_id: str) -> List[Dict[str, Any]]:
     query = f"'{folder_id}' in parents and mimeType contains 'video/'"
     resp = drive.files().list(q=query, fields="files(id,name)").execute()
     return resp.get("files", [])
 
-def list_first_video_in_folder(drive, folder_id: str) -> Optional[Dict[str, Any]]:
+
+def list_first_video_in_folder(drive,
+                               folder_id: str) -> Optional[Dict[str, Any]]:
     query = f"'{folder_id}' in parents and mimeType contains 'video/'"
-    resp = drive.files().list(q=query, orderBy="createdTime", pageSize=10,
+    resp = drive.files().list(q=query,
+                              orderBy="createdTime",
+                              pageSize=10,
                               fields="files(id,name,createdTime)").execute()
     files = resp.get("files", [])
     return files[0] if files else None
+
 
 def download_drive_file(drive, file_id: str, filename: str) -> str:
     request = drive.files().get_media(fileId=file_id)
@@ -198,15 +234,20 @@ def download_drive_file(drive, file_id: str, filename: str) -> str:
         f.write(fh.getvalue())
     return local_path
 
+
 def delete_drive_file(drive, file_id: str):
     try:
         drive.files().delete(fileId=file_id).execute()
     except Exception as e:
         logging.error(f"Delete error: {e}")
 
-# Gemini helpers (كما كانت)
-TRENDING_TAGS = ["Trending", "Viral", "Shorts", "AI", "Creative", "YouTube",
-                 "Funny", "Tech", "Magic", "Surprise"]
+
+# ===================== (اختياري) Gemini metadata generation =====================
+TRENDING_TAGS = [
+    "Trending", "Viral", "Shorts", "AI", "Creative", "YouTube", "Funny",
+    "Tech", "Magic", "Surprise"
+]
+
 
 def infer_context_tags(filename: str) -> List[str]:
     name = (filename or "").lower()
@@ -229,7 +270,10 @@ def infer_context_tags(filename: str) -> List[str]:
             seen.add(t)
     return out
 
-def format_hashtags(trending: List[str], contextual: List[str], max_total: int = 10) -> str:
+
+def format_hashtags(trending: List[str],
+                    contextual: List[str],
+                    max_total: int = 10) -> str:
     mixed = trending[:5] + contextual[:5]
     if len(mixed) < max_total:
         for r in trending[5:] + contextual[5:]:
@@ -239,7 +283,9 @@ def format_hashtags(trending: List[str], contextual: List[str], max_total: int =
                 mixed.append(r)
     return " ".join(f"#{t.replace(' ', '')}" for t in mixed)
 
-def generate_metadata_with_gemini(video_path: str, filename_hint: str = "") -> Dict[str, str]:
+
+def generate_metadata_with_gemini(video_path: str,
+                                  filename_hint: str = "") -> Dict[str, str]:
     contextual = infer_context_tags(filename_hint)
     trending = TRENDING_TAGS.copy()
     try:
@@ -281,16 +327,30 @@ def generate_metadata_with_gemini(video_path: str, filename_hint: str = "") -> D
     except Exception as e:
         logging.error(f"Gemini error: {e}")
         hashtags = format_hashtags(trending, contextual, max_total=10)
-        return {"title": "AI Magic: Surprising Transformation!",
-                "description": "Fallback description.\n" + hashtags}
+        return {
+            "title": "AI Magic: Surprising Transformation!",
+            "description": "Fallback description.\n" + hashtags
+        }
 
-# Upload to YouTube (كما كانت)
-def upload_to_youtube(youtube, video_path: str, meta: Dict[str, str]) -> Optional[str]:
+
+# ===================== Upload to YouTube with clear errors =====================
+def upload_to_youtube(youtube, video_path: str,
+                      meta: Dict[str, str]) -> Optional[str]:
     try:
-        body = {"snippet": {"title": meta["title"], "description": meta["description"], "categoryId": "22"},
-                "status": {"privacyStatus": "public"}}
+        body = {
+            "snippet": {
+                "title": meta["title"],
+                "description": meta["description"],
+                "categoryId": "22"
+            },
+            "status": {
+                "privacyStatus": "public"
+            }
+        }
         media = MediaFileUpload(video_path, chunksize=-1, resumable=True)
-        request = youtube.videos().insert(part="snippet,status", body=body, media_body=media)
+        request = youtube.videos().insert(part="snippet,status",
+                                          body=body,
+                                          media_body=media)
         response = None
         tries = 0
         while response is None:
@@ -307,23 +367,33 @@ def upload_to_youtube(youtube, video_path: str, meta: Dict[str, str]) -> Optiona
     except Exception as e:
         return f"ERR:Generic {str(e)}"
 
-# Publish now flow (قليل التعديل ليستعمل context.application)
+
+# ===================== Publish Now flow =====================
 async def publish_now(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
     cfg = get_chat(chat_id)
     folder_id = cfg.get("drive_folder_id")
     if not folder_id:
-        await context.bot.send_message(chat_id, "❌ لم يتم ضبط معرف مجلد درايف بعد.")
+        await context.bot.send_message(chat_id,
+                                       "❌ لم يتم ضبط معرف مجلد درايف بعد.")
         return
+
     try:
         drive, youtube = build_services(cfg)
         file = list_first_video_in_folder(drive, folder_id)
         if not file:
-            await context.bot.send_message(chat_id, "❌ لا يوجد فيديوهات في هذا المجلد.")
+            await context.bot.send_message(
+                chat_id, "❌ لا يوجد فيديوهات في هذا المجلد.")
             return
-        await context.bot.send_message(chat_id, f"🔍 جاري التحليل وتوليد البيانات للفيديو: {file['name']}")
+
+        await context.bot.send_message(
+            chat_id, f"🔍 جاري التحليل وتوليد البيانات للفيديو: {file['name']}")
         local_path = download_drive_file(drive, file["id"], file["name"])
-        meta = generate_metadata_with_gemini(local_path, filename_hint=file["name"])
-        await context.bot.send_message(chat_id, f"⬆️ جاري الرفع إلى يوتيوب...\nTitle: {meta['title']}")
+
+        meta = generate_metadata_with_gemini(local_path,
+                                             filename_hint=file["name"])
+        await context.bot.send_message(
+            chat_id, f"⬆️ جاري الرفع إلى يوتيوب...\nTitle: {meta['title']}")
+
         url_or_err = upload_to_youtube(youtube, local_path, meta)
         if isinstance(url_or_err, str) and url_or_err.startswith("ERR:"):
             reason = url_or_err.split(":", 1)[1]
@@ -332,21 +402,30 @@ async def publish_now(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
                 msg += "\nالسبب: تجاوز حد الرفع المؤقت في يوتيوب."
             else:
                 msg += f"\nالسبب: {reason}."
-            await context.bot.send_message(chat_id, msg, reply_markup=after_publish_keyboard())
+            await context.bot.send_message(
+                chat_id, msg, reply_markup=after_publish_keyboard())
             return
+
         delete_drive_file(drive, file["id"])
         remaining = len(list_videos(drive, folder_id))
-        await context.bot.send_message(chat_id,
-                                       f"✅ تم النشر!\nعدد الفيديوات المتبقية: {remaining}\nرابط الفيديو: {url_or_err}",
-                                       reply_markup=after_publish_keyboard())
+        await context.bot.send_message(
+            chat_id,
+            f"✅ تم النشر!\nعدد الفيديوات المتبقية: {remaining}\nرابط الفيديو: {url_or_err}",
+            reply_markup=after_publish_keyboard())
+
     except HttpError as e:
         logging.error(f"publish_now HttpError: {e}")
-        await context.bot.send_message(chat_id, f"❌ خطأ YouTube/Drive: {e}", reply_markup=after_publish_keyboard())
+        await context.bot.send_message(chat_id,
+                                       f"❌ خطأ YouTube/Drive: {e}",
+                                       reply_markup=after_publish_keyboard())
     except Exception as e:
         logging.error(f"publish_now error: {e}")
-        await context.bot.send_message(chat_id, f"❌ حدث خطأ أثناء النشر: {e}", reply_markup=after_publish_keyboard())
+        await context.bot.send_message(chat_id,
+                                       f"❌ حدث خطأ أثناء النشر: {e}",
+                                       reply_markup=after_publish_keyboard())
 
-# next_scheduled_time_text, scheduling helpers (كما كانت)
+
+# ===================== Next scheduled text helper (unchanged) =====================
 def next_scheduled_time_text(times: List[str]) -> str:
     if not times:
         return "غير محدد"
@@ -356,7 +435,12 @@ def next_scheduled_time_text(times: List[str]) -> str:
     for t in times:
         try:
             hh, mm = map(int, t.split(":"))
-            dt = pytz.datetime.datetime(today.year, today.month, today.day, hh, mm, tzinfo=TZ)
+            dt = pytz.datetime.datetime(today.year,
+                                        today.month,
+                                        today.day,
+                                        hh,
+                                        mm,
+                                        tzinfo=TZ)
             if dt > now:
                 candidates.append(dt)
         except Exception:
@@ -370,9 +454,12 @@ def next_scheduled_time_text(times: List[str]) -> str:
     except Exception:
         return "غير محدد"
 
+
+# ===================== Scheduling helpers (unchanged) =====================
 async def scheduled_post(context: ContextTypes.DEFAULT_TYPE):
     chat_id = context.job.data["chat_id"]
     await publish_now(chat_id, context)
+
 
 def clear_chat_jobs(app, chat_id: int):
     for job in app.job_queue.jobs():
@@ -382,23 +469,30 @@ def clear_chat_jobs(app, chat_id: int):
         except Exception:
             continue
 
+
 def schedule_daily_jobs(app, chat_id: int, times: List[str]):
     clear_chat_jobs(app, chat_id)
     for t in times:
         try:
             hh, mm = map(int, t.split(":"))
             run_time = dtime(hour=hh, minute=mm, tzinfo=TZ)
-            app.job_queue.run_daily(scheduled_post, time=run_time, data={"chat_id": chat_id},
+            app.job_queue.run_daily(scheduled_post,
+                                    time=run_time,
+                                    data={"chat_id": chat_id},
                                     name=f"autopost_{chat_id}_{t}")
         except Exception as e:
             logging.error(f"Failed scheduling time {t}: {e}")
     logging.info(f"Scheduled {len(times)} jobs for chat {chat_id}.")
 
-# Handlers: start / document / text / buttons (كما كانت، فقط بدون تغييرات منطقية)
+
+# ===================== Handlers: start / document / text / buttons =====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     cfg = get_chat(chat_id)
-    if cfg.get("setup_complete") and cfg.get("refresh_token") and cfg.get("drive_folder_id"):
+
+    # لو الإعدادات كاملة نحاول عرض عدد الفيديوهات
+    if cfg.get("setup_complete") and cfg.get("refresh_token") and cfg.get(
+            "drive_folder_id"):
         count_text = "غير قابل للقراءة"
         error = None
         try:
@@ -408,6 +502,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             error = str(e)
             logging.error(f"Drive read failed for {chat_id}: {error}")
+
         if error:
             await update.message.reply_text(
                 f"👋 مرحبًا! الإعدادات محفوظة.\n⚠️ لكن قراءة المجلد فشلت: {error}\nعدد الفيديوهات (محاولة): {count_text}",
@@ -417,23 +512,34 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"👋 مرحبًا! الإعدادات محفوظة.\nعدد الفيديوهات في المجلد: {count_text}",
                 reply_markup=main_menu_keyboard())
         return
+
+    # إن لم تكتمل الإعدادات نبدأ التدفق التفاعلي
     if cfg.get("next") == "await_json":
-        await update.message.reply_text("📄 أرسل الآن ملف JSON الخاص بـ OAuth (client_secret.json).")
+        await update.message.reply_text(
+            "📄 أرسل الآن ملف JSON الخاص بـ OAuth (client_secret.json).")
         return
     else:
         await update.message.reply_text(
-            "⚠️ إكمال الإعداد مطلوب. أرسل ملف JSON للبدء (client_secret.json).")
+            "⚠️ إكمال الإعداد مطلوب. أرسل ملف JSON للبدء (client_secret.json)."
+        )
+
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     cfg = get_chat(chat_id)
+
+    # فقط نقبل ملف JSON في مرحلة await_json
     if cfg.get("next") != "await_json":
-        await update.message.reply_text("⚠️ لست في مرحلة رفع JSON الآن. استخدم /start لإعادة التهيئة.")
+        await update.message.reply_text(
+            "⚠️ لست في مرحلة رفع JSON الآن. استخدم /start لإعادة التهيئة.")
         return
+
     doc = update.message.document
     if not doc or not doc.file_name.endswith(".json"):
-        await update.message.reply_text("❌ أرسل ملف JSON فقط (client_secret.json).")
+        await update.message.reply_text(
+            "❌ أرسل ملف JSON فقط (client_secret.json).")
         return
+
     file = await context.bot.get_file(doc.file_id)
     tmp_dir = tempfile.mkdtemp(prefix="json_")
     local_path = os.path.join(tmp_dir, doc.file_name)
@@ -441,33 +547,43 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         with open(local_path, "r", encoding="utf-8") as f:
             oauth_json = json.load(f)
+        # تحقق من الحقول الأساسية
         fields = extract_oauth_fields(oauth_json)
         cfg["oauth_json"] = oauth_json
         cfg["oauth_client_id"] = fields["client_id"]
         cfg["oauth_client_secret"] = fields["client_secret"]
-        cfg["oauth_token_uri"] = fields.get("token_uri", OAUTH_TOKEN_URI_DEFAULT)
+        cfg["oauth_token_uri"] = fields.get("token_uri",
+                                            OAUTH_TOKEN_URI_DEFAULT)
         cfg["next"] = "await_refresh"
         save_user_file(chat_id, cfg)
-        await update.message.reply_text("🔐 تم استلام JSON. أرسل الآن الـ Refresh Token (نص).")
+        await update.message.reply_text(
+            "🔐 تم استلام JSON. أرسل الآن الـ Refresh Token (نص).")
     except Exception as e:
         logging.error(f"Invalid JSON upload from {chat_id}: {e}")
         await update.message.reply_text(f"❌ ملف JSON غير صالح: {e}")
+
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     text = (update.message.text or "").strip()
     cfg = get_chat(chat_id)
+
+    # Refresh token stage
     if cfg.get("next") == "await_refresh":
         cfg["refresh_token"] = text
         cfg["next"] = "await_folder"
         save_user_file(chat_id, cfg)
-        await update.message.reply_text("📁 الآن أرسل معرف مجلد الفيديوات في Google Drive (folder_id).")
+        await update.message.reply_text(
+            "📁 الآن أرسل معرف مجلد الفيديوات في Google Drive (folder_id).")
         return
+
+    # Drive folder stage
     if cfg.get("next") == "await_folder":
         cfg["drive_folder_id"] = text
         cfg["next"] = "idle"
         cfg["setup_complete"] = True
         save_user_file(chat_id, cfg)
+        # اختبر قراءة الملفات وبلغ المستخدم
         try:
             drive, _ = build_services(cfg)
             files = list_videos(drive, cfg["drive_folder_id"])
@@ -480,14 +596,20 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"⚠️ تم حفظ الإعدادات لكن فشل الوصول إلى Drive: {e}\nستظل البيانات محفوظة يمكنك تعديلها لاحقًا.",
                 reply_markup=main_menu_keyboard())
         return
+
+    # أوامر سريعة
     if text.lower() in ("انشر الان", "/publish", "publish now"):
         await publish_now(chat_id, context)
         return
+
     if text.strip() in ("ضبط النشر التلقائي", "/autopost"):
         cfg["next"] = "await_times_count"
         save_user_file(chat_id, cfg)
-        await update.message.reply_text("📊 أرسل عدد الفيديوهات يومياً (من 1 إلى 7).")
+        await update.message.reply_text(
+            "📊 أرسل عدد الفيديوهات يومياً (من 1 إلى 7).")
         return
+
+    # autopost times flow
     if cfg.get("next") == "await_times_count":
         try:
             n = int(text)
@@ -498,10 +620,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             cfg["autopost_times"] = []
             cfg["next"] = "await_time_1"
             save_user_file(chat_id, cfg)
-            await update.message.reply_text("⏰ أرسل وقت نشر الفيديو الأول بصيغة HH:MM (مثال 13:30).")
+            await update.message.reply_text(
+                "⏰ أرسل وقت نشر الفيديو الأول بصيغة HH:MM (مثال 13:30).")
         except Exception:
-            await update.message.reply_text("❌ صيغة غير صحيحة. أرسل عددًا بين 1 و7.")
+            await update.message.reply_text(
+                "❌ صيغة غير صحيحة. أرسل عددًا بين 1 و7.")
         return
+
     if cfg.get("next", "").startswith("await_time_"):
         try:
             hh, mm = map(int, text.split(":"))
@@ -513,31 +638,44 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 next_idx = len(cfg["autopost_times"]) + 1
                 cfg["next"] = f"await_time_{next_idx}"
                 save_user_file(chat_id, cfg)
-                await update.message.reply_text(f"⏰ أرسل وقت نشر الفيديو رقم {next_idx} بصيغة HH:MM.")
+                await update.message.reply_text(
+                    f"⏰ أرسل وقت نشر الفيديو رقم {next_idx} بصيغة HH:MM.")
             else:
                 cfg["next"] = "idle"
                 cfg["autopost_enabled"] = True
                 save_user_file(chat_id, cfg)
-                schedule_daily_jobs(context.application, chat_id, cfg["autopost_times"])
-                await update.message.reply_text("✅ تم تفعيل النشر التلقائي يوميًا حسب الأوقات المضبوطة.",
-                                                reply_markup=autopost_control_keyboard())
+                schedule_daily_jobs(context.application, chat_id,
+                                    cfg["autopost_times"])
+                await update.message.reply_text(
+                    "✅ تم تفعيل النشر التلقائي يوميًا حسب الأوقات المضبوطة.",
+                    reply_markup=autopost_control_keyboard())
         except Exception:
-            await update.message.reply_text("❌ وقت غير صالح. استخدم صيغة HH:MM (مثال 08:15).")
+            await update.message.reply_text(
+                "❌ وقت غير صالح. استخدم صيغة HH:MM (مثال 08:15).")
         return
+
+    # fallback help
     await update.message.reply_text(
-        "الأوامر:\n- /start بدء أو إظهار الحالة.\n- انشر الان للنشر الفوري.\n- ضبط النشر التلقائي لضبط الأوقات اليومية.")
+        "الأوامر:\n"
+        "- /start بدء أو إظهار الحالة.\n"
+        "- انشر الان للنشر الفوري.\n"
+        "- ضبط النشر التلقائي لضبط الأوقات اليومية.")
+
 
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     chat_id = query.message.chat.id
     cfg = get_chat(chat_id)
+
     if query.data in ("save_yes", "save_no"):
         cfg["save_info"] = (query.data == "save_yes")
         cfg["next"] = "idle"
-        if cfg["save_info"] and cfg.get("refresh_token") and cfg.get("drive_folder_id"):
+        if cfg["save_info"] and cfg.get("refresh_token") and cfg.get(
+                "drive_folder_id"):
             cfg["setup_complete"] = True
         save_user_file(chat_id, cfg)
+        # count videos if possible
         count = 0
         try:
             drive, _ = build_services(cfg)
@@ -548,103 +686,47 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"✅ تم الإعداد.\nعدد الفيديوات في المجلد: {count}\nاختر طريقة النشر:",
             reply_markup=main_menu_keyboard())
         return
+
     if query.data == "publish_now":
         await query.edit_message_text("⏳ جاري النشر الآن...")
         await publish_now(chat_id, context)
         return
+
     if query.data == "autopost_setup":
         cfg["next"] = "await_times_count"
         save_user_file(chat_id, cfg)
-        await query.edit_message_text("📊 أرسل عدد الفيديوهات يومياً (من 1 إلى 7).")
+        await query.edit_message_text(
+            "📊 أرسل عدد الفيديوهات يومياً (من 1 إلى 7).")
         return
+
     if query.data == "autopost_stop":
         cfg["autopost_enabled"] = False
         cfg["autopost_times"] = []
         cfg["autopost_count"] = 0
         save_user_file(chat_id, cfg)
         clear_chat_jobs(context.application, chat_id)
-        await query.edit_message_text("⛔ تم إيقاف النشر التلقائي.", reply_markup=main_menu_keyboard())
+        await query.edit_message_text("⛔ تم إيقاف النشر التلقائي.",
+                                      reply_markup=main_menu_keyboard())
         return
+
     if query.data == "show_settings":
-        msg = (f"📋 إعداداتك الحالية:\n"
-               f"- حفظ المعلومات: {'✅' if cfg.get('setup_complete') else '❌'}\n"
-               f"- معرف المجلد: {cfg.get('drive_folder_id') or 'غير مضبوط'}\n"
-               f"- النشر التلقائي: {'✅' if cfg.get('autopost_enabled') else '❌'}\n"
-               f"- الأوقات: {', '.join(cfg.get('autopost_times', [])) or 'لا يوجد'}")
+        msg = (
+            f"📋 إعداداتك الحالية:\n"
+            f"- حفظ المعلومات: {'✅' if cfg.get('setup_complete') else '❌'}\n"
+            f"- معرف المجلد: {cfg.get('drive_folder_id') or 'غير مضبوط'}\n"
+            f"- النشر التلقائي: {'✅' if cfg.get('autopost_enabled') else '❌'}\n"
+            f"- الأوقات: {', '.join(cfg.get('autopost_times', [])) or 'لا يوجد'}"
+        )
         await query.edit_message_text(msg, reply_markup=main_menu_keyboard())
         return
-    await query.edit_message_text("خيار غير معروف.", reply_markup=main_menu_keyboard())
 
-# =========== Web / FastAPI + Telegram webhook integration =============
-app = FastAPI(title="Telegram Webhook App")
+    await query.edit_message_text("خيار غير معروف.",
+                                  reply_markup=main_menu_keyboard())
 
-# خيار CORS إن احتجت
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
-# نُنشئ تطبيق التلجرام ولكن لا نُشغّله بعد
-telegram_app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
-
-# نربط الهاندلرز بنفس الطريقة
-telegram_app.add_handler(CommandHandler("start", start))
-telegram_app.add_handler(CallbackQueryHandler(on_button))
-telegram_app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
-telegram_app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text))
-
-# endpoint للتأكد
-@app.get("/")
-async def root():
-    return {"ok": True, "message": "service alive"}
-
-# webhook receiver
-@app.post("/webhook/{secret}")
-async def webhook_receiver(secret: str, request: Request):
-    if secret != WEBHOOK_SECRET:
-        raise HTTPException(status_code=403, detail="Forbidden")
-    try:
-        data = await request.json()
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON")
-    update = Update.de_json(data, telegram_app.bot)
-    # وضع التحديث في طابور المعالجة داخل التطبيق
-    await telegram_app.update_queue.put(update)
-    return {"ok": True}
-
-# startup/shutdown events: نهيئ التطبيق ونضبط webhook عند التشغيل، ونحذفه عند الإيقاف
-@app.on_event("startup")
-async def on_startup():
-    logging.info("FastAPI startup: initializing Telegram application...")
-    await telegram_app.initialize()
-    # ضبط webhook في تيليجرام إن كانت المتغيرات متاحة
-    if WEBHOOK_BASE and WEBHOOK_SECRET:
-        webhook_url = f"{WEBHOOK_BASE.rstrip('/')}/webhook/{WEBHOOK_SECRET}"
-        try:
-            await telegram_app.bot.set_webhook(url=webhook_url, secret_token=WEBHOOK_SECRET)
-            logging.info(f"Set Telegram webhook: {webhook_url}")
-        except Exception as e:
-            logging.error(f"Failed to set webhook: {e}")
-    # بدء تشغيل خدمات داخلية للتطبيق (job queue, dispatcher)
-    await telegram_app.start()
-    logging.info("Telegram application started (webhook mode).")
-
-@app.on_event("shutdown")
-async def on_shutdown():
-    logging.info("FastAPI shutdown: stopping Telegram application...")
-    try:
-        if WEBHOOK_BASE and WEBHOOK_SECRET:
-            await telegram_app.bot.delete_webhook()
-    except Exception:
-        pass
-    await telegram_app.stop()
-    await telegram_app.shutdown()
-    logging.info("Telegram application stopped.")
-
-# ==== دعم تحميل حالة عامة (اختياري) ====
+# ============== Polling entrypoint ==============
 def load_state():
+    # نحاول تحميل ملف فهرس عام (اختياري) إن رغبت مستقبلًا
     global USER_STATE
     if os.path.exists(STATE_FILE):
         try:
@@ -653,4 +735,25 @@ def load_state():
             logging.info("Loaded global state file.")
         except Exception:
             logging.warning("Failed to load global state file; continuing.")
+
+
 load_state()
+
+
+def main():
+    application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CallbackQueryHandler(on_button))
+    application.add_handler(
+        MessageHandler(filters.Document.ALL, handle_document))
+    application.add_handler(
+        MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text))
+
+    logging.info("Starting polling...")
+    application.run_polling(allowed_updates=Update.ALL_TYPES,
+                            drop_pending_updates=True)
+
+
+if __name__ == "__main__":
+    main()
