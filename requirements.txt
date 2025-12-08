@@ -1,10 +1,12 @@
 fastapi==0.95.2
 uvicorn[standard]==0.22.0
+
 python-telegram-bot==20.7
+
 google-api-python-client==2.88.0
+google-auth>=2.15.0,<3.0.0
 google-auth-oauthlib==1.1.0
 google-generativeai==0.8.5
+
 python-dotenv==1.0.0
 pytz==2023.3
-# let pip resolve google-auth to a compatible version (do NOT pin to 2.24.0)
-google-auth>=2.15.0,<3.0.0
