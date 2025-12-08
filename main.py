@@ -1,43 +1,49 @@
 # main.py
 import os
-import json
-import logging
-import tempfile
 import io
+import json
 import time
-import threading
+import tempfile
+import logging
 from typing import Dict, Any, List, Optional
 from datetime import time as dtime
 
 import pytz
 from dotenv import load_dotenv
+
 from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import JSONResponse
+
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (ApplicationBuilder, CommandHandler, MessageHandler,
                           CallbackQueryHandler, ContextTypes, filters)
 
-# Google / Gemini imports (كما في كودك الأصلي)
+# Gemini (إن لم تستخدم Gemini اوقف الاستدعاء أو ضع مفتاح فارغ)
 import google.generativeai as genai
+
+# Google APIs
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload
 from googleapiclient.errors import HttpError
 
-# ==== logging و env ====
+# ====== إعداد لوجنج و env ======
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s | %(levelname)s | %(message)s")
 load_dotenv()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-WEBHOOK_BASE = os.getenv("WEBHOOK_BASE")  # مثال: https://your-service.onrender.com
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+# العنوان الكامل للويب هوك (مثال: https://yourdomain.com/webhook/SECRET)
+WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").strip()
+# رمز سري اختيارى لفحص المصدر (يوصى به). ستقوم بتعيينه أيضاً عند وضع webhook.
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
 
 if not TELEGRAM_BOT_TOKEN:
     raise RuntimeError("يرجى ضبط TELEGRAM_BOT_TOKEN في متغيرات البيئة.")
 
 if GOOGLE_API_KEY:
     genai.configure(api_key=GOOGLE_API_KEY)
-
 GEMINI_MODEL = "gemini-2.5-flash"
 TZ = pytz.timezone("Africa/Algiers")
 
@@ -49,7 +55,7 @@ USER_STATE: Dict[int, Dict[str, Any]] = {}
 
 OAUTH_TOKEN_URI_DEFAULT = "https://oauth2.googleapis.com/token"
 
-# ---------- مساعدات حفظ/تحميل المستخدمين ----------
+# ---------- User files helpers (كما في كودك الأصلي) ----------
 def user_filepath(chat_id: int) -> str:
     return os.path.join(USERS_DIR, f"{chat_id}.json")
 
@@ -59,9 +65,12 @@ def load_user_file(chat_id: int) -> Optional[Dict[str, Any]]:
     if os.path.exists(path):
         try:
             with open(path, "r", encoding="utf-8") as f:
-                return json.load(f)
+                data = json.load(f)
+            logging.info(f"Loaded user file for {chat_id}")
+            return data
         except Exception as e:
             logging.error(f"Failed to load user file {path}: {e}")
+            return None
     return None
 
 
@@ -70,11 +79,12 @@ def save_user_file(chat_id: int, data: Dict[str, Any]):
     try:
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
+        logging.info(f"Saved user file for {chat_id}")
     except Exception as e:
         logging.error(f"Failed to save user file {path}: {e}")
 
 
-# ---------- حالة في الذاكرة ----------
+# memory state (مثل كودك)
 def get_chat(chat_id: int) -> Dict[str, Any]:
     if chat_id in USER_STATE:
         return USER_STATE[chat_id]
@@ -99,7 +109,7 @@ def get_chat(chat_id: int) -> Dict[str, Any]:
     return USER_STATE[chat_id]
 
 
-# ---------- لوحات الأزرار ----------
+# keyboards (كما في كودك)
 def main_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [[InlineKeyboardButton("انشر الآن", callback_data="publish_now")],
@@ -112,18 +122,19 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
                                   callback_data="show_settings")
          ]])
 
+def yes_no_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("نعم", callback_data="save_yes"),
+                                  InlineKeyboardButton("لا", callback_data="save_no")]])
 
 def after_publish_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton("📋 عرض الإعدادات الحالية",
-                                                     callback_data="show_settings")]])
-
+                             callback_data="show_settings")]])
 
 def autopost_control_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton("⛔ إيقاف النشر التلقائي",
-                                                     callback_data="autopost_stop")]])
+                             callback_data="autopost_stop")]])
 
-
-# ---------- OAuth helpers ----------
+# ======= OAuth / Google build helpers (كما في كودك) =======
 def extract_oauth_fields(oauth_json: Dict[str, Any]) -> Dict[str, str]:
     block = oauth_json.get("installed") or oauth_json.get("web")
     if not block:
@@ -137,7 +148,6 @@ def extract_oauth_fields(oauth_json: Dict[str, Any]) -> Dict[str, str]:
         "client_secret": block["client_secret"],
         "token_uri": token_uri
     }
-
 
 def build_services(cfg: Dict[str, Any]):
     client_id = cfg.get("oauth_client_id")
@@ -174,24 +184,17 @@ def build_services(cfg: Dict[str, Any]):
     youtube = build("youtube", "v3", credentials=creds)
     return drive, youtube
 
-
-# ---------- Drive helpers ----------
+# Drive helpers (كما في كودك)
 def list_videos(drive, folder_id: str) -> List[Dict[str, Any]]:
     query = f"'{folder_id}' in parents and mimeType contains 'video/'"
     resp = drive.files().list(q=query, fields="files(id,name)").execute()
     return resp.get("files", [])
 
-
-def list_first_video_in_folder(drive,
-                               folder_id: str) -> Optional[Dict[str, Any]]:
+def list_first_video_in_folder(drive, folder_id: str) -> Optional[Dict[str, Any]]:
     query = f"'{folder_id}' in parents and mimeType contains 'video/'"
-    resp = drive.files().list(q=query,
-                              orderBy="createdTime",
-                              pageSize=10,
-                              fields="files(id,name,createdTime)").execute()
+    resp = drive.files().list(q=query, orderBy="createdTime", pageSize=10, fields="files(id,name,createdTime)").execute()
     files = resp.get("files", [])
     return files[0] if files else None
-
 
 def download_drive_file(drive, file_id: str, filename: str) -> str:
     request = drive.files().get_media(fileId=file_id)
@@ -207,20 +210,17 @@ def download_drive_file(drive, file_id: str, filename: str) -> str:
         f.write(fh.getvalue())
     return local_path
 
-
 def delete_drive_file(drive, file_id: str):
     try:
         drive.files().delete(fileId=file_id).execute()
     except Exception as e:
         logging.error(f"Delete error: {e}")
 
-
-# ---------- Gemini metadata (fallback safe) ----------
+# Gemini metadata generation (كما في كودك)
 TRENDING_TAGS = [
     "Trending", "Viral", "Shorts", "AI", "Creative", "YouTube", "Funny",
     "Tech", "Magic", "Surprise"
 ]
-
 
 def infer_context_tags(filename: str) -> List[str]:
     name = (filename or "").lower()
@@ -243,7 +243,6 @@ def infer_context_tags(filename: str) -> List[str]:
             seen.add(t)
     return out
 
-
 def format_hashtags(trending: List[str],
                     contextual: List[str],
                     max_total: int = 10) -> str:
@@ -256,9 +255,7 @@ def format_hashtags(trending: List[str],
                 mixed.append(r)
     return " ".join(f"#{t.replace(' ', '')}" for t in mixed)
 
-
-def generate_metadata_with_gemini(video_path: str,
-                                  filename_hint: str = "") -> Dict[str, str]:
+def generate_metadata_with_gemini(video_path: str, filename_hint: str = "") -> Dict[str, str]:
     contextual = infer_context_tags(filename_hint)
     trending = TRENDING_TAGS.copy()
     try:
@@ -305,10 +302,8 @@ def generate_metadata_with_gemini(video_path: str,
             "description": "Fallback description.\n" + hashtags
         }
 
-
-# ========== YouTube upload helper ==========
-def upload_to_youtube(youtube, video_path: str,
-                      meta: Dict[str, str]) -> Optional[str]:
+# YouTube upload (كما في كودك)
+def upload_to_youtube(youtube, video_path: str, meta: Dict[str, str]) -> Optional[str]:
     try:
         body = {
             "snippet": {
@@ -321,9 +316,7 @@ def upload_to_youtube(youtube, video_path: str,
             }
         }
         media = MediaFileUpload(video_path, chunksize=-1, resumable=True)
-        request = youtube.videos().insert(part="snippet,status",
-                                          body=body,
-                                          media_body=media)
+        request = youtube.videos().insert(part="snippet,status", body=body, media_body=media)
         response = None
         tries = 0
         while response is None:
@@ -340,29 +333,27 @@ def upload_to_youtube(youtube, video_path: str,
     except Exception as e:
         return f"ERR:Generic {str(e)}"
 
-
-# ========== Publish flow ==========
+# Publish now flow (async)
 async def publish_now(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
     cfg = get_chat(chat_id)
     folder_id = cfg.get("drive_folder_id")
     if not folder_id:
-        await context.bot.send_message(chat_id,
-                                       "❌ لم يتم ضبط معرف مجلد درايف بعد.")
+        await context.bot.send_message(chat_id, "❌ لم يتم ضبط معرف مجلد درايف بعد.")
         return
+
     try:
         drive, youtube = build_services(cfg)
         file = list_first_video_in_folder(drive, folder_id)
         if not file:
-            await context.bot.send_message(
-                chat_id, "❌ لا يوجد فيديوهات في هذا المجلد.")
+            await context.bot.send_message(chat_id, "❌ لا يوجد فيديوهات في هذا المجلد.")
             return
-        await context.bot.send_message(
-            chat_id, f"🔍 جاري التحليل وتوليد البيانات للفيديو: {file['name']}")
+
+        await context.bot.send_message(chat_id, f"🔍 جاري التحليل وتوليد البيانات للفيديو: {file['name']}")
         local_path = download_drive_file(drive, file["id"], file["name"])
-        meta = generate_metadata_with_gemini(local_path,
-                                             filename_hint=file["name"])
-        await context.bot.send_message(
-            chat_id, f"⬆️ جاري الرفع إلى يوتيوب...\nTitle: {meta['title']}")
+
+        meta = generate_metadata_with_gemini(local_path, filename_hint=file["name"])
+        await context.bot.send_message(chat_id, f"⬆️ جاري الرفع إلى يوتيوب...\nTitle: {meta['title']}")
+
         url_or_err = upload_to_youtube(youtube, local_path, meta)
         if isinstance(url_or_err, str) and url_or_err.startswith("ERR:"):
             reason = url_or_err.split(":", 1)[1]
@@ -371,41 +362,57 @@ async def publish_now(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
                 msg += "\nالسبب: تجاوز حد الرفع المؤقت في يوتيوب."
             else:
                 msg += f"\nالسبب: {reason}."
-            await context.bot.send_message(
-                chat_id, msg, reply_markup=after_publish_keyboard())
+            await context.bot.send_message(chat_id, msg, reply_markup=after_publish_keyboard())
             return
+
         delete_drive_file(drive, file["id"])
         remaining = len(list_videos(drive, folder_id))
-        await context.bot.send_message(
-            chat_id,
-            f"✅ تم النشر!\nعدد الفيديوات المتبقية: {remaining}\nرابط الفيديو: {url_or_err}",
-            reply_markup=after_publish_keyboard())
+        await context.bot.send_message(chat_id,
+                                       f"✅ تم النشر!\nعدد الفيديوات المتبقية: {remaining}\nرابط الفيديو: {url_or_err}",
+                                       reply_markup=after_publish_keyboard())
+
     except HttpError as e:
         logging.error(f"publish_now HttpError: {e}")
-        await context.bot.send_message(chat_id,
-                                       f"❌ خطأ YouTube/Drive: {e}",
-                                       reply_markup=after_publish_keyboard())
+        await context.bot.send_message(chat_id, f"❌ خطأ YouTube/Drive: {e}", reply_markup=after_publish_keyboard())
     except Exception as e:
         logging.error(f"publish_now error: {e}")
-        await context.bot.send_message(chat_id,
-                                       f"❌ حدث خطأ أثناء النشر: {e}",
-                                       reply_markup=after_publish_keyboard())
+        await context.bot.send_message(chat_id, f"❌ حدث خطأ أثناء النشر: {e}", reply_markup=after_publish_keyboard())
 
+# Scheduling helpers (unchanged)
+def next_scheduled_time_text(times: List[str]) -> str:
+    if not times:
+        return "غير محدد"
+    now = pytz.datetime.datetime.now(TZ)
+    today = now.date()
+    candidates = []
+    for t in times:
+        try:
+            hh, mm = map(int, t.split(":"))
+            dt = pytz.datetime.datetime(today.year, today.month, today.day, hh, mm, tzinfo=TZ)
+            if dt > now:
+                candidates.append(dt)
+        except Exception:
+            continue
+    if candidates:
+        nxt = min(candidates)
+        return nxt.strftime("%H:%M")
+    try:
+        hh, mm = map(int, times[0].split(":"))
+        return f"{hh:02d}:{mm:02d} (غدًا)"
+    except Exception:
+        return "غير محدد"
 
-# ========== Scheduling helpers ==========
 async def scheduled_post(context: ContextTypes.DEFAULT_TYPE):
     chat_id = context.job.data["chat_id"]
     await publish_now(chat_id, context)
 
-
 def clear_chat_jobs(app, chat_id: int):
-    for job in app.job_queue.jobs():
-        try:
+    try:
+        for job in app.job_queue.jobs():
             if job.data and job.data.get("chat_id") == chat_id:
                 job.schedule_removal()
-        except Exception:
-            continue
-
+    except Exception:
+        pass
 
 def schedule_daily_jobs(app, chat_id: int, times: List[str]):
     clear_chat_jobs(app, chat_id)
@@ -413,19 +420,16 @@ def schedule_daily_jobs(app, chat_id: int, times: List[str]):
         try:
             hh, mm = map(int, t.split(":"))
             run_time = dtime(hour=hh, minute=mm, tzinfo=TZ)
-            app.job_queue.run_daily(scheduled_post,
-                                    time=run_time,
-                                    data={"chat_id": chat_id},
-                                    name=f"autopost_{chat_id}_{t}")
+            app.job_queue.run_daily(scheduled_post, time=run_time, data={"chat_id": chat_id}, name=f"autopost_{chat_id}_{t}")
         except Exception as e:
             logging.error(f"Failed scheduling time {t}: {e}")
     logging.info(f"Scheduled {len(times)} jobs for chat {chat_id}.")
 
-
-# ========== Handlers ==========
+# Handlers: start / document / text / buttons (معدل ليتعامل مع application)
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     cfg = get_chat(chat_id)
+
     if cfg.get("setup_complete") and cfg.get("refresh_token") and cfg.get("drive_folder_id"):
         count_text = "غير قابل للقراءة"
         error = None
@@ -436,35 +440,32 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             error = str(e)
             logging.error(f"Drive read failed for {chat_id}: {error}")
+
         if error:
-            await update.message.reply_text(
-                f"👋 مرحبًا! الإعدادات محفوظة.\n⚠️ لكن قراءة المجلد فشلت: {error}\nعدد الفيديوهات (محاولة): {count_text}",
-                reply_markup=main_menu_keyboard())
+            await update.message.reply_text(f"👋 مرحبًا! الإعدادات محفوظة.\n⚠️ لكن قراءة المجلد فشلت: {error}\nعدد الفيديوهات (محاولة): {count_text}", reply_markup=main_menu_keyboard())
         else:
-            await update.message.reply_text(
-                f"👋 مرحبًا! الإعدادات محفوظة.\nعدد الفيديوهات في المجلد: {count_text}",
-                reply_markup=main_menu_keyboard())
+            await update.message.reply_text(f"👋 مرحبًا! الإعدادات محفوظة.\nعدد الفيديوهات في المجلد: {count_text}", reply_markup=main_menu_keyboard())
         return
+
     if cfg.get("next") == "await_json":
-        await update.message.reply_text(
-            "📄 أرسل الآن ملف JSON الخاص بـ OAuth (client_secret.json).")
+        await update.message.reply_text("📄 أرسل الآن ملف JSON الخاص بـ OAuth (client_secret.json).")
         return
     else:
-        await update.message.reply_text(
-            "⚠️ إكمال الإعداد مطلوب. أرسل ملف JSON للبدء (client_secret.json).")
-
+        await update.message.reply_text("⚠️ إكمال الإعداد مطلوب. أرسل ملف JSON للبدء (client_secret.json).")
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     cfg = get_chat(chat_id)
+
     if cfg.get("next") != "await_json":
-        await update.message.reply_text(
-            "⚠️ لست في مرحلة رفع JSON الآن. استخدم /start لإعادة التهيئة.")
+        await update.message.reply_text("⚠️ لست في مرحلة رفع JSON الآن. استخدم /start لإعادة التهيئة.")
         return
+
     doc = update.message.document
     if not doc or not doc.file_name.endswith(".json"):
         await update.message.reply_text("❌ أرسل ملف JSON فقط (client_secret.json).")
         return
+
     file = await context.bot.get_file(doc.file_id)
     tmp_dir = tempfile.mkdtemp(prefix="json_")
     local_path = os.path.join(tmp_dir, doc.file_name)
@@ -484,17 +485,18 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logging.error(f"Invalid JSON upload from {chat_id}: {e}")
         await update.message.reply_text(f"❌ ملف JSON غير صالح: {e}")
 
-
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     text = (update.message.text or "").strip()
     cfg = get_chat(chat_id)
+
     if cfg.get("next") == "await_refresh":
         cfg["refresh_token"] = text
         cfg["next"] = "await_folder"
         save_user_file(chat_id, cfg)
         await update.message.reply_text("📁 الآن أرسل معرف مجلد الفيديوات في Google Drive (folder_id).")
         return
+
     if cfg.get("next") == "await_folder":
         cfg["drive_folder_id"] = text
         cfg["next"] = "idle"
@@ -504,22 +506,21 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             drive, _ = build_services(cfg)
             files = list_videos(drive, cfg["drive_folder_id"])
             count = len(files)
-            await update.message.reply_text(
-                f"✅ تم حفظ الإعدادات. عدد الفيديوهات في المجلد: {count}",
-                reply_markup=main_menu_keyboard())
+            await update.message.reply_text(f"✅ تم حفظ الإعدادات. عدد الفيديوهات في المجلد: {count}", reply_markup=main_menu_keyboard())
         except Exception as e:
-            await update.message.reply_text(
-                f"⚠️ تم حفظ الإعدادات لكن فشل الوصول إلى Drive: {e}\nستظل البيانات محفوظة يمكنك تعديلها لاحقًا.",
-                reply_markup=main_menu_keyboard())
+            await update.message.reply_text(f"⚠️ تم حفظ الإعدادات لكن فشل الوصول إلى Drive: {e}\nستظل البيانات محفوظة يمكنك تعديلها لاحقًا.", reply_markup=main_menu_keyboard())
         return
+
     if text.lower() in ("انشر الان", "/publish", "publish now"):
         await publish_now(chat_id, context)
         return
+
     if text.strip() in ("ضبط النشر التلقائي", "/autopost"):
         cfg["next"] = "await_times_count"
         save_user_file(chat_id, cfg)
         await update.message.reply_text("📊 أرسل عدد الفيديوهات يومياً (من 1 إلى 7).")
         return
+
     if cfg.get("next") == "await_times_count":
         try:
             n = int(text)
@@ -534,6 +535,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             await update.message.reply_text("❌ صيغة غير صحيحة. أرسل عددًا بين 1 و7.")
         return
+
     if cfg.get("next", "").startswith("await_time_"):
         try:
             hh, mm = map(int, text.split(":"))
@@ -551,24 +553,19 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 cfg["autopost_enabled"] = True
                 save_user_file(chat_id, cfg)
                 schedule_daily_jobs(context.application, chat_id, cfg["autopost_times"])
-                await update.message.reply_text(
-                    "✅ تم تفعيل النشر التلقائي يوميًا حسب الأوقات المضبوطة.",
-                    reply_markup=autopost_control_keyboard())
+                await update.message.reply_text("✅ تم تفعيل النشر التلقائي يوميًا حسب الأوقات المضبوطة.", reply_markup=autopost_control_keyboard())
         except Exception:
             await update.message.reply_text("❌ وقت غير صالح. استخدم صيغة HH:MM (مثال 08:15).")
         return
-    await update.message.reply_text(
-        "الأوامر:\n"
-        "- /start بدء أو إظهار الحالة.\n"
-        "- انشر الان للنشر الفوري.\n"
-        "- ضبط النشر التلقائي لضبط الأوقات اليومية.")
 
+    await update.message.reply_text("الأوامر:\n- /start بدء أو إظهار الحالة.\n- انشر الان للنشر الفوري.\n- ضبط النشر التلقائي لضبط الأوقات اليومية.")
 
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     chat_id = query.message.chat.id
     cfg = get_chat(chat_id)
+
     if query.data in ("save_yes", "save_no"):
         cfg["save_info"] = (query.data == "save_yes")
         cfg["next"] = "idle"
@@ -581,19 +578,20 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             count = len(list_videos(drive, cfg["drive_folder_id"]))
         except Exception as e:
             logging.error(f"Count videos error: {e}")
-        await query.edit_message_text(
-            f"✅ تم الإعداد.\nعدد الفيديوات في المجلد: {count}\nاختر طريقة النشر:",
-            reply_markup=main_menu_keyboard())
+        await query.edit_message_text(f"✅ تم الإعداد.\nعدد الفيديوات في المجلد: {count}\nاختر طريقة النشر:", reply_markup=main_menu_keyboard())
         return
+
     if query.data == "publish_now":
         await query.edit_message_text("⏳ جاري النشر الآن...")
         await publish_now(chat_id, context)
         return
+
     if query.data == "autopost_setup":
         cfg["next"] = "await_times_count"
         save_user_file(chat_id, cfg)
         await query.edit_message_text("📊 أرسل عدد الفيديوهات يومياً (من 1 إلى 7).")
         return
+
     if query.data == "autopost_stop":
         cfg["autopost_enabled"] = False
         cfg["autopost_times"] = []
@@ -602,6 +600,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         clear_chat_jobs(context.application, chat_id)
         await query.edit_message_text("⛔ تم إيقاف النشر التلقائي.", reply_markup=main_menu_keyboard())
         return
+
     if query.data == "show_settings":
         msg = (
             f"📋 إعداداتك الحالية:\n"
@@ -612,95 +611,104 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         await query.edit_message_text(msg, reply_markup=main_menu_keyboard())
         return
+
     await query.edit_message_text("خيار غير معروف.", reply_markup=main_menu_keyboard())
 
+# ---------- Application + FastAPI webhook integration ----------
+fastapp = FastAPI(title="Telegram Webhook FastAPI App")
 
-# ========== إعداد تطبيق التليجرام ==========
-application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
-application.add_handler(CommandHandler("start", start))
-application.add_handler(CallbackQueryHandler(on_button))
-application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
-application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text))
+# global references
+APPLICATION = None  # telegram.ext.Application
 
-
-# ========== FastAPI app ====
-fastapp = FastAPI(title="BotBroAIPost")
-
-@fastapp.get("/")
-async def index():
-    return {"ok": True, "bot": "BotBroAIPost"}
-
-# Webhook endpoint (سيتم استدعاؤه من Telegram إذا ضبطت WEBHOOK_BASE)
-@fastapp.post("/webhook/{token}")
-async def telegram_webhook(token: str, request: Request):
-    # لمزيد من الأمان نتحقق إن المسار يحتوي على التوكين الفعلي للبوت
-    if token != TELEGRAM_BOT_TOKEN:
-        logging.warning("Received webhook with invalid token in path.")
-        raise HTTPException(status_code=403, detail="Invalid token")
-    body = await request.json()
-    try:
-        update = Update.de_json(body, application.bot)
-        # ضع التحديث في طابور التطبيق ليعالجه handlers
-        await application.update_queue.put(update)
-    except Exception as e:
-        logging.exception("Failed to process incoming webhook update.")
-        raise HTTPException(status_code=400, detail=str(e))
-    return {"ok": True}
-
-
-# ========== startup / shutdown hooks ==========
-def _run_polling_in_thread():
-    """تشغيل polling في thread منفصل (يستخدم إن لم يكن WEBHOOK_BASE مضبوط)."""
-    try:
-        logging.info("Starting polling (background thread).")
-        # run_polling سيبقى يعمل في هذا الخيط
-        application.run_polling(allowed_updates=Update.ALL_TYPES,
-                                drop_pending_updates=True)
-    except Exception:
-        logging.exception("Polling thread crashed.")
-
-
+# startup: build application, add handlers, initialize and start (so job_queue works)
 @fastapp.on_event("startup")
 async def on_startup():
-    logging.info("FastAPI startup: initializing Telegram application.")
-    # ensure application.initialize/startup run to setup internal components
-    await application.initialize()
-    # إذا ضبطت WEBHOOK_BASE فسنعين webhook إلى URL الخاص بك
-    if WEBHOOK_BASE:
-        webhook_url = f"{WEBHOOK_BASE.rstrip('/')}/webhook/{TELEGRAM_BOT_TOKEN}"
+    global APPLICATION
+    logging.info("Starting Telegram Application (webhook mode)...")
+    APPLICATION = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+
+    # add handlers (same as polling version)
+    APPLICATION.add_handler(CommandHandler("start", start))
+    APPLICATION.add_handler(CallbackQueryHandler(on_button))
+    APPLICATION.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    APPLICATION.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text))
+
+    # initialize and start application background tasks (job queue, etc.)
+    await APPLICATION.initialize()
+    await APPLICATION.start()
+    logging.info("Telegram Application initialized and started (no polling).")
+
+    # If WEBHOOK_URL configured, set bot webhook on Telegram side to point to it
+    if WEBHOOK_URL:
         try:
-            await application.bot.set_webhook(webhook_url)
-            logging.info(f"Webhook set to {webhook_url}")
-        except Exception:
-            logging.exception("Failed to set webhook.")
-        # ثم شغّل معالجة التحديثات داخليًا (application.start)
-        await application.start()
-        logging.info("Telegram application started in webhook mode.")
-    else:
-        # نستخدم polling في thread لأن uvicorn/ASGI يستخدم الخيوط/الـ event loop الخاصة به
-        t = threading.Thread(target=_run_polling_in_thread, daemon=True)
-        t.start()
-        logging.info("Polling thread started.")
+            # set secret token header if provided (Telegram will send X-Telegram-Bot-Api-Secret-Token)
+            if WEBHOOK_SECRET:
+                await APPLICATION.bot.set_webhook(url=WEBHOOK_URL, secret_token=WEBHOOK_SECRET)
+            else:
+                await APPLICATION.bot.set_webhook(url=WEBHOOK_URL)
+            logging.info(f"Set webhook to {WEBHOOK_URL}")
+        except Exception as e:
+            logging.error(f"Failed to set webhook: {e}")
 
-
+# shutdown: remove webhook (if set) and stop app
 @fastapp.on_event("shutdown")
 async def on_shutdown():
-    logging.info("FastAPI shutdown: stopping Telegram application.")
+    global APPLICATION
+    logging.info("Shutting down Telegram Application...")
     try:
-        if WEBHOOK_BASE:
+        if APPLICATION and WEBHOOK_URL:
             try:
-                await application.bot.delete_webhook()
-                logging.info("Webhook deleted.")
+                await APPLICATION.bot.delete_webhook()
             except Exception:
-                logging.exception("Failed to delete webhook on shutdown.")
-        # طلب إيقاف التطبيق (سيوقف polling أو غيره)
-        await application.stop()
-        await application.shutdown()
-    except Exception:
-        logging.exception("Error during Telegram application shutdown.")
+                pass
+        if APPLICATION:
+            await APPLICATION.stop()
+            await APPLICATION.shutdown()
+    except Exception as e:
+        logging.error(f"Shutdown error: {e}")
+    logging.info("Telegram Application stopped.")
 
+# health/root endpoint
+@fastapp.get("/")
+async def root():
+    return {"ok": True, "mode": "webhook"}
 
-# ========== مساعدة تحميل حالة عامة (اختياري) ==========
+# webhook receive endpoint
+# Telegram will POST updates here. Use the same path used when setting webhook (WEBHOOK_URL).
+@fastapp.post("/webhook")
+@fastapp.post("/webhook/{secret}")
+async def telegram_webhook(request: Request, secret: Optional[str] = None):
+    global APPLICATION
+    if WEBHOOK_SECRET:
+        # verify secret token if provided in path or header
+        # preferred: check header "X-Telegram-Bot-Api-Secret-Token"
+        header_secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
+        if WEBHOOK_SECRET and header_secret != WEBHOOK_SECRET:
+            # also allow path-secret if user used that
+            if secret != WEBHOOK_SECRET:
+                logging.warning("Webhook secret mismatch.")
+                raise HTTPException(status_code=403, detail="Forbidden")
+    body = await request.json()
+    # basic sanity
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Bad request")
+    if not APPLICATION:
+        raise HTTPException(status_code=503, detail="Application not ready")
+    try:
+        update = Update.de_json(body, bot=APPLICATION.bot)
+        # push update to application's update queue for processing by handlers
+        await APPLICATION.update_queue.put(update)
+    except Exception as e:
+        logging.exception(f"Failed to process incoming update: {e}")
+        raise HTTPException(status_code=500, detail="Internal error")
+    return JSONResponse({"ok": True})
+
+# optional endpoint to show basic state for debugging
+@fastapp.get("/_internal/state")
+async def internal_state():
+    return {"user_count": len(USER_STATE), "webhook": WEBHOOK_URL != ""}
+
+# keep a light load_state if you want
 def load_state():
     global USER_STATE
     if os.path.exists(STATE_FILE):
@@ -710,6 +718,5 @@ def load_state():
             logging.info("Loaded global state file.")
         except Exception:
             logging.warning("Failed to load global state file; continuing.")
-
 
 load_state()
