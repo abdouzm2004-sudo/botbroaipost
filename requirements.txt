@@ -1,7 +1,7 @@
 fastapi==0.95.2
 uvicorn[standard]==0.22.0
 
-# السماح بترقية python-telegram-bot لسلسلة 20.x الأحدث لحل مشكلة Updater
+# Allow latest 20.x PTB for Python 3.11 compatibility and bugfixes
 python-telegram-bot>=20.7,<21.0
 
 google-api-python-client==2.88.0
